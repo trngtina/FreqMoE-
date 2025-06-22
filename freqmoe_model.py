@@ -1,165 +1,194 @@
+"""
+freqmoe_model.py
+
+Core implementation of the Frequency-domain Mixture of Experts (FreqMoE) model
+with residual refinement blocks for time series forecasting.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+class ComplexReLU(nn.Module):
+    """Complex-valued ReLU: applies ReLU separately to real and imaginary parts."""
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return torch.complex(F.relu(z.real), F.relu(z.imag))
+
+
 class FrequencyBands(nn.Module):
-    
+    """Learnable frequency band boundaries that produce binary masks."""
     def __init__(self, num_experts: int, freq_bins: int):
-        super(FrequencyBands, self).__init__()
-        self.N = num_experts
-        self.F = freq_bins
-        self.bound_params = nn.Parameter(torch.zeros(self.N - 1))
+        super().__init__()
+        self.num_experts = num_experts
+        self.freq_bins = freq_bins
+        # raw boundary parameters (one less than experts)
+        self.bound_params = nn.Parameter(torch.zeros(num_experts - 1))
 
-    def forward(self):
-        raw = torch.sigmoid(self.bound_params)       # (N−1,)
-        all_bounds = torch.cat((torch.tensor([0.0], device=raw.device),
-                                raw,
-                                torch.tensor([1.0], device=raw.device)))
+    def forward(self) -> torch.Tensor:
+        raw = torch.sigmoid(self.bound_params)
+        all_bounds = torch.cat([
+            raw.new_tensor([0.0]),
+            raw,
+            raw.new_tensor([1.0])
+        ])
         sorted_bounds, _ = torch.sort(all_bounds)
-        indices = (sorted_bounds * (self.F - 1)).long()  # (N+1,)
-
+        indices = (sorted_bounds * (self.freq_bins - 1)).long()
         masks = []
-        for i in range(self.N):
-            start_idx = indices[i].item()
-            end_idx = indices[i + 1].item() if i < self.N - 1 else self.F
-            m = torch.zeros(self.F, device=raw.device)
-            if end_idx > start_idx:
-                m[start_idx:end_idx] = 1.0
+        for i in range(self.num_experts):
+            start = indices[i].item()
+            end   = indices[i+1].item() if i < self.num_experts - 1 else self.freq_bins
+            m = torch.zeros(self.freq_bins, device=raw.device)
+            if end > start:
+                m[start:end] = 1.0
             masks.append(m)
-        return torch.stack(masks, dim=0)  # (N, F)
+        return torch.stack(masks, dim=0)  # (num_experts, freq_bins)
+
 
 class ComplexLinear(nn.Module):
-
+    """Complex-valued linear layer mapping C^Fin -> C^Fout."""
     def __init__(self, in_features: int, out_features: int):
-        super(ComplexLinear, self).__init__()
-        self.W_re = nn.Parameter(torch.randn(out_features, in_features) * 0.1)
-        self.W_im = nn.Parameter(torch.randn(out_features, in_features) * 0.1)
-        self.b_re = nn.Parameter(torch.zeros(out_features))
-        self.b_im = nn.Parameter(torch.zeros(out_features))
+        super().__init__()
+        self.weight_real = nn.Parameter(torch.randn(out_features, in_features) * 0.1)
+        self.weight_imag = nn.Parameter(torch.randn(out_features, in_features) * 0.1)
+        self.bias_real   = nn.Parameter(torch.zeros(out_features))
+        self.bias_imag   = nn.Parameter(torch.zeros(out_features))
 
-    def forward(self, x: torch.Tensor):
-        # x: (B, C, F_in), complex64
-        x_re = x.real.view(-1, x.size(-1))  # (B*C, F_in)
-        x_im = x.imag.view(-1, x.size(-1))  # (B*C, F_in)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        xr = x.real
+        xi = x.imag
+        B, C, Fin = xr.shape
+        xr_flat = xr.view(B * C, Fin)
+        xi_flat = xi.view(B * C, Fin)
+        out_real = (self.weight_real @ xr_flat.t() - self.weight_imag @ xi_flat.t()).t() + self.bias_real
+        out_imag = (self.weight_real @ xi_flat.t() + self.weight_imag @ xr_flat.t()).t() + self.bias_imag
+        Fout = out_real.size(-1)
+        out_real = out_real.view(B, C, Fout)
+        out_imag = out_imag.view(B, C, Fout)
+        return torch.complex(out_real, out_imag)
 
-        out_re = (self.W_re @ x_re.t() - self.W_im @ x_im.t()).t()
-        out_im = (self.W_re @ x_im.t() + self.W_im @ x_re.t()).t()
-
-        out_re = out_re + self.b_re.unsqueeze(0)
-        out_im = out_im + self.b_im.unsqueeze(0)
-
-        B, C, _ = x.shape
-        F_out = out_re.size(-1)
-        out_re = out_re.view(B, C, F_out)
-        out_im = out_im.view(B, C, F_out)
-        return torch.complex(out_re, out_im)
 
 class GateNetwork(nn.Module):
-
+    """Gating network producing softmax weights for experts."""
     def __init__(self, num_experts: int, freq_bins: int):
-        super(GateNetwork, self).__init__()
+        super().__init__()
         self.lin = nn.Linear(freq_bins, num_experts)
 
-    def forward(self, Xf: torch.Tensor):
+    def forward(self, Xf: torch.Tensor) -> torch.Tensor:
+        # Xf: (B, C, F)
         mag = torch.mean(torch.abs(Xf), dim=1)  # (B, F)
-        logits = self.lin(mag)                  # (B, N)
-        return F.softmax(logits, dim=-1)        # (B, N)
+        logits = self.lin(mag)                  # (B, num_experts)
+        return F.softmax(logits, dim=-1)        # (B, num_experts)
+
 
 class FreqMoEBlock(nn.Module):
-
+    """Single Frequency-domain Mixture of Experts block with increased capacity."""
     def __init__(self, num_experts: int, num_channels: int, lookback: int):
-        super(FreqMoEBlock, self).__init__()
-        self.N = num_experts
-        self.C = num_channels
-        self.L = lookback
-        self.F = (self.L // 2) + 1
+        super().__init__()
+        self.num_experts = num_experts
+        self.num_channels = num_channels
+        self.lookback     = lookback
+        self.freq_bins    = (lookback // 2) + 1
 
-        self.freq_bands = FrequencyBands(self.N, self.F)
-        self.experts = nn.ModuleList([
+        # equal-width hidden dimension twice the freq_bins
+        hidden_dim = self.freq_bins * 2
+        self.freq_bands = FrequencyBands(num_experts, self.freq_bins)
+        self.experts    = nn.ModuleList([
             nn.Sequential(
-                ComplexLinear(self.F, self.F),
-                nn.Lambda(lambda z: torch.complex(F.relu(z.real), F.relu(z.imag))),
-                ComplexLinear(self.F, self.F)
-            ) for _ in range(self.N)
+                ComplexLinear(self.freq_bins, hidden_dim),
+                ComplexReLU(),
+                ComplexLinear(hidden_dim, self.freq_bins)
+            ) for _ in range(num_experts)
         ])
-        self.gate = GateNetwork(self.N, self.F)
+        self.gate = GateNetwork(num_experts, self.freq_bins)
 
-    def forward(self, X_time: torch.Tensor):
+    def forward(self, X_time: torch.Tensor) -> torch.Tensor:
+        # X_time: (B, C, L)
         B, C, L = X_time.shape
-        Xf = torch.fft.rfft(X_time, dim=-1)          # (B, C, F)
-        masks = self.freq_bands()                    # (N, F)
+        Xf = torch.fft.rfft(X_time, dim=-1)  # (B, C, freq_bins)
 
+        masks = self.freq_bands()            # (num_experts, freq_bins)
         expert_outs = []
         for i, expert in enumerate(self.experts):
-            m = masks[i].view(1, 1, self.F).to(Xf.device).type(Xf.dtype)
-            Xi = Xf * m
-            Yi = expert(Xi)
-            expert_outs.append(Yi)
+            m = masks[i].view(1, 1, self.freq_bins).type(Xf.dtype)
+            expert_outs.append(expert(Xf * m))  # (B, C, freq_bins)
 
-        gate_w = self.gate(Xf)                       # (B, N)
+        gate_w = self.gate(Xf)               # (B, num_experts)
         Xf_comb = torch.zeros_like(Xf)
         for i, Yi in enumerate(expert_outs):
-            gi = gate_w[:, i].view(B, 1, 1)
-            Xf_comb += Yi * gi
+            Xf_comb += Yi * gate_w[:, i].view(B, 1, 1)
 
-        X_recon = torch.fft.irfft(Xf_comb, n=self.L, dim=-1)  # (B, C, L)
-        return X_recon
+        return torch.fft.irfft(Xf_comb, n=L, dim=-1)  # (B, C, L)
+
 
 class ResidualRefineBlock(nn.Module):
-
+    """Residual refinement block for forecasting beyond reconstruction."""
     def __init__(self, num_channels: int, lookback: int, horizon: int, dropout: float = 0.3):
-        super(ResidualRefineBlock, self).__init__()
-        self.C = num_channels
-        self.L = lookback
-        self.H = horizon
-        self.F_in = (self.L // 2) + 1
-        self.F_out = ((self.L + self.H) // 2) + 1
+        super().__init__()
+        self.lookback = lookback
+        self.horizon  = horizon
+        self.F_in     = (lookback // 2) + 1
+        self.F_out    = ((lookback + horizon) // 2) + 1
 
-        self.up1 = ComplexLinear(self.F_in, self.F_out)
-        self.act = nn.Lambda(lambda z: torch.complex(F.relu(z.real), F.relu(z.imag)))
+        self.up1      = ComplexLinear(self.F_in, self.F_out)
+        self.act      = ComplexReLU()
         self.dropout = nn.Dropout(dropout)
-        self.up2 = ComplexLinear(self.F_out, self.F_out)
+        self.up2      = ComplexLinear(self.F_out, self.F_out)
 
-    def forward(self, residual_time: torch.Tensor):
+    def forward(self, residual_time: torch.Tensor) -> torch.Tensor:
+        # residual_time: (B, C, L)
         B, C, L = residual_time.shape
-        Rf = torch.fft.rfft(residual_time, dim=-1)     # (B, C, F_in)
-        H1 = self.up1(Rf)                              # (B, C, F_out)
+        Rf = torch.fft.rfft(residual_time, dim=-1)  # (B, C, F_in)
+
+        H1 = self.up1(Rf)
         H1 = self.act(H1)
-        H1 = self.dropout(H1)
-        Rf_up = self.up2(H1)                           # (B, C, F_out)
-        correction_full = torch.fft.irfft(Rf_up, n=self.L + self.H, dim=-1)
-        return correction_full                         # (B, C, L+H)
+        # apply dropout separately
+        real = self.dropout(H1.real)
+        imag = self.dropout(H1.imag)
+        H1 = torch.complex(real, imag)
+
+        Rf_up = self.up2(H1)  # (B, C, F_out)
+        return torch.fft.irfft(Rf_up, n=self.lookback + self.horizon, dim=-1)
+
 
 class FreqMoE(nn.Module):
+    """Full FreqMoE model stacking MoE block + residual refinements."""
+    def __init__(
+        self,
+        num_experts: int,
+        num_channels: int,
+        lookback: int,
+        horizon: int,
+        num_refine_blocks: int = 3,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+        self.lookback         = lookback
+        self.horizon          = horizon
+        self.num_experts      = num_experts
+        self.num_channels     = num_channels
 
-    def __init__(self, num_experts: int, num_channels: int, lookback: int, horizon: int, num_refine_blocks: int = 3, dropout: float = 0.3):
-        super(FreqMoE, self).__init__()
-        self.L = lookback
-        self.H = horizon
-        self.C = num_channels
-        self.N = num_experts
-        self.K = num_refine_blocks
-
-        self.moe_block = FreqMoEBlock(self.N, self.C, self.L)
-        self.refine_blocks = nn.ModuleList([
-            ResidualRefineBlock(self.C, self.L, self.H, dropout=dropout)
-            for _ in range(self.K)
+        self.moe_block        = FreqMoEBlock(num_experts, num_channels, lookback)
+        self.refine_blocks    = nn.ModuleList([
+            ResidualRefineBlock(num_channels, lookback, horizon, dropout)
+            for _ in range(num_refine_blocks)
         ])
 
-    def forward(self, X_time: torch.Tensor):
+    def forward(self, X_time: torch.Tensor) -> torch.Tensor:
+        # X_time: (B, C, L)
         B, C, L = X_time.shape
-        assert C == self.C and L == self.L
+        # initial reconstruction
+        X_recon = self.moe_block(X_time)  # (B, C, L)
 
-        X_recon = self.moe_block(X_time)              # (B, C, L)
-        y_pred = torch.zeros(B, C, self.H, device=X_time.device, dtype=X_time.dtype)
-        residual = X_time - X_recon                   # (B, C, L)
+        # placeholder for forecast
+        y_pred = torch.zeros(B, C, self.horizon, device=X_time.device, dtype=X_time.dtype)
+        residual = X_time - X_recon        # (B, C, L)
 
         for block in self.refine_blocks:
-            corr_full = block(residual)               # (B, C, L+H)
-            corr_rec = corr_full[:, :, :self.L]       # (B, C, L)
-            corr_fct = corr_full[:, :, self.L:]       # (B, C, H)
+            corr_full = block(residual)    # (B, C, L+H)
+            corr_rec  = corr_full[..., :self.lookback]
+            corr_fct  = corr_full[..., self.lookback:]
+            residual  = residual - corr_rec
+            y_pred    = y_pred + corr_fct
 
-            residual = residual - corr_rec
-            y_pred = y_pred + corr_fct
-
-        return y_pred
+        return y_pred  # (B, C, horizon)
