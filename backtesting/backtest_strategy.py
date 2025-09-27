@@ -1,9 +1,3 @@
-\"\"\"
-backtest_strategy.py
-
-Simple long/short strategy: go long if forecast > 0, short if < 0.
-\"\"\"
-
 import pandas as pd
 
 def generate_signals(returns: pd.DataFrame, forecasts: pd.DataFrame) -> pd.DataFrame:

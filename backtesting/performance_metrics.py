@@ -1,9 +1,3 @@
-\"\"\"
-performance_metrics.py
-
-Compute cumulative returns, Sharpe ratio, max drawdown, hit rate.
-\"\"\"
-
 import numpy as np
 import pandas as pd
 from empyrical import stats
